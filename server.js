@@ -1,45 +1,38 @@
 /**
  * Morpheus WhatsApp Server
- * Servidor HTTP próprio baseado em Baileys (open source)
- * Expõe a mesma API da Evolution API — compatível com o sistema Morpheus
+ * Servidor HTTP baseado em Baileys (ESM-compatible via dynamic import)
+ * Compatível com Evolution API — usado pelo sistema Morpheus PDV
  *
  * Endpoints:
- *   GET  /status           → estado da conexão
- *   GET  /qr               → QR Code em base64 (para exibir no sistema)
- *   POST /send             → enviar mensagem { phone, message }
- *   POST /logout           → desconectar sessão
- *   GET  /health           → healthcheck
- *
- * Autenticação: header  apikey: SUA_CHAVE
+ *   GET  /health                          → healthcheck (sem auth)
+ *   GET  /status                          → estado da conexão
+ *   GET  /qr                              → QR Code em base64
+ *   POST /send                            → enviar { phone, message }
+ *   POST /logout                          → desconectar sessão
+ *   POST /reconnect                       → reconectar sem logout
+ *   GET  /instance/fetchInstances         → listar instâncias (Evolution API)
+ *   GET  /instance/connectionState/:inst  → estado (Evolution API)
+ *   GET  /instance/connect/:inst          → conectar / buscar QR (Evolution API)
+ *   POST /instance/create                 → criar instância (no-op)
+ *   DELETE /instance/logout/:inst         → logout (Evolution API)
+ *   POST /message/sendText/:inst          → enviar texto (Evolution API)
  */
 
 require('dotenv').config();
 
-const express  = require('express');
-const QRCode   = require('qrcode');
-const pino     = require('pino');
-const path     = require('path');
-const fs       = require('fs');
-
-// ── Importa Baileys ───────────────────────────────────────────
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    makeInMemoryStore,
-    delay,
-} = require('@whiskeysockets/baileys');
+const express = require('express');
+const QRCode  = require('qrcode');
+const pino    = require('pino');
+const path    = require('path');
+const fs      = require('fs');
 
 // ── Configurações ─────────────────────────────────────────────
 const PORT          = process.env.PORT          || 65002;
 const API_KEY       = process.env.API_KEY       || 'morpheus-wpp-2026';
 const INSTANCE_NAME = process.env.INSTANCE_NAME || 'morpheus-pdv';
 const AUTH_DIR      = path.join(__dirname, 'auth_session');
-const LOG_LEVEL     = process.env.LOG_LEVEL     || 'silent';
 
-const logger = pino({ level: LOG_LEVEL });
-const app    = express();
+const app = express();
 app.use(express.json());
 
 // ── Estado global ─────────────────────────────────────────────
@@ -56,47 +49,57 @@ const state = {
 // ── Middleware de autenticação ─────────────────────────────────
 function auth(req, res, next) {
     const key = req.headers['apikey'] || req.headers['api-key'] || req.query.apikey;
-    if (key !== API_KEY) {
-        return res.status(401).json({ error: 'Chave de API inválida.' });
-    }
+    if (key !== API_KEY) return res.status(401).json({ error: 'Chave de API inválida.' });
     next();
 }
 
-// ── Iniciar / reconectar WhatsApp ─────────────────────────────
-let _reconnectCount = 0;
-let _starting = false;   // evita múltiplas chamadas simultâneas
+// ── Utilitário de delay ───────────────────────────────────────
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── Controle de reconexão ─────────────────────────────────────
+let _reconnectCount = 0;
+let _starting       = false;
+
+// ── Iniciar WhatsApp com dynamic import (suporte ESM) ─────────
 async function startWhatsApp() {
-    if (_starting) return;   // já está iniciando — ignora chamada duplicada
+    if (_starting) return;
     _starting = true;
-    // Garante diretório de sessão
+
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+
+    // ── Dynamic import do Baileys (ESM) ───────────────────────
+    const {
+        default: makeWASocket,
+        useMultiFileAuthState,
+        DisconnectReason,
+        fetchLatestBaileysVersion,
+        delay,
+    } = await import('@whiskeysockets/baileys');
 
     const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
-    // fetchLatestBaileysVersion pode falhar — usamos versão estável como fallback
     let version = [2, 3000, 1015901307];
     try {
         const result = await fetchLatestBaileysVersion();
         version = result.version;
-    } catch (e) {
-        console.log('[WPP] Não foi possível buscar versão atual, usando fallback:', version.join('.'));
+    } catch (_) {
+        console.log('[WPP] Usando versão fallback:', version.join('.'));
     }
 
     console.log(`[WPP] Iniciando Baileys v${version.join('.')}...`);
 
     const sock = makeWASocket({
         version,
-        auth:             authState,
-        logger:           pino({ level: 'silent' }),
-        printQRInTerminal: true,
-        browser:          ['Morpheus PDV', 'Chrome', '120.0'],
-        connectTimeoutMs:  30_000,
+        auth:                authState,
+        logger:              pino({ level: 'silent' }),
+        printQRInTerminal:   true,
+        browser:             ['Morpheus PDV', 'Chrome', '120.0'],
+        connectTimeoutMs:    30_000,
         keepAliveIntervalMs: 25_000,
         retryRequestDelayMs: 2_000,
         syncFullHistory:     false,
         markOnlineOnConnect: false,
-        getMessage: async () => undefined,
+        getMessage:          async () => undefined,
     });
 
     state.sock = sock;
@@ -109,9 +112,8 @@ async function startWhatsApp() {
             state.connected   = false;
             state.qrRaw       = qr;
             state.qrUpdatedAt = Date.now();
-            state.qrBase64 = await QRCode.toDataURL(qr, {
-                width: 300,
-                margin: 2,
+            state.qrBase64    = await QRCode.toDataURL(qr, {
+                width: 300, margin: 2,
                 color: { dark: '#000000', light: '#FFFFFF' },
             });
             console.log('[WPP] QR Code pronto — escaneie no celular');
@@ -140,23 +142,23 @@ async function startWhatsApp() {
             if (shouldReconnect) {
                 _reconnectCount++;
                 const waitMs = Math.min(3000 * _reconnectCount, 30000);
-                console.log(`[WPP] Aguardando ${waitMs}ms antes de reconectar (tentativa ${_reconnectCount})...`);
+                console.log(`[WPP] Aguardando ${waitMs}ms (tentativa ${_reconnectCount})...`);
                 await delay(waitMs);
                 startWhatsApp();
             } else {
                 console.log('[WPP] Logout detectado — limpando sessão...');
                 state.status = 'logged_out';
+                state.sock   = null;
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             }
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
-
     return sock;
 }
 
-// ── Formatar número para WhatsApp ─────────────────────────────
+// ── Formatar número ────────────────────────────────────────────
 function formatPhone(phone) {
     let n = phone.replace(/\D/g, '');
     if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
@@ -173,48 +175,48 @@ app.get('/health', (req, res) => {
 
 app.get('/status', auth, (req, res) => {
     res.json({
-        status:      state.status,
-        connected:   state.connected,
-        phone:       state.phoneNumber,
-        qr_ready:    !!state.qrBase64,
-        qr_age_ms:   state.qrUpdatedAt ? Date.now() - state.qrUpdatedAt : null,
+        status:    state.status,
+        connected: state.connected,
+        phone:     state.phoneNumber,
+        qr_ready:  !!state.qrBase64,
+        qr_age_ms: state.qrUpdatedAt ? Date.now() - state.qrUpdatedAt : null,
     });
 });
 
-// ── Compatibilidade Evolution API ─────────────────────────────
-
 app.get('/instance/fetchInstances', auth, (req, res) => {
-    res.json([{ instanceName: INSTANCE_NAME, instance: { instanceName: INSTANCE_NAME, status: state.status } }]);
+    res.json([{
+        instanceName: INSTANCE_NAME,
+        instance: { instanceName: INSTANCE_NAME, status: state.status },
+    }]);
 });
 
 app.get('/instance/connectionState/:instance', auth, (req, res) => {
-    const evState = state.connected ? 'open' : (state.status === 'qr_ready' ? 'connecting' : 'close');
+    const evState = state.connected ? 'open'
+        : state.status === 'qr_ready' ? 'connecting'
+        : 'close';
     res.json({ instance: { instanceName: req.params.instance, state: evState } });
 });
 
-// Conectar / buscar QR Code — inicia Baileys se necessário
 app.get('/instance/connect/:instance', auth, async (req, res) => {
     if (state.connected) {
         return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
     }
-    // Inicia Baileys se ainda não estiver rodando
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => {
             console.error('[WPP] Erro ao iniciar:', err.message);
             _starting = false;
         });
     }
-    // Aguarda QR ficar disponível (até 20s)
     let waited = 0;
     while (!state.qrBase64 && !state.connected && waited < 20000) {
-        await delay(500);
+        await sleep(500);
         waited += 500;
     }
     if (state.connected) {
         return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
     }
     if (!state.qrBase64) {
-        return res.status(202).json({ error: 'QR ainda não disponível. Tente novamente em instantes.' });
+        return res.status(202).json({ error: 'QR ainda não disponível. Tente novamente.' });
     }
     res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
 });
@@ -252,32 +254,29 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
     }
 });
 
-app.get('/qr', auth, (req, res) => {
-    if (state.connected) {
-        return res.json({ error: 'Já conectado. Não há QR para exibir.' });
+app.get('/qr', auth, async (req, res) => {
+    if (state.connected) return res.json({ error: 'Já conectado.' });
+    if (!state.sock && !_starting) {
+        startWhatsApp().catch(err => { _starting = false; });
     }
     if (!state.qrBase64) {
         return res.status(202).json({
-            error: 'QR ainda não disponível. Aguarde alguns segundos e tente novamente.',
+            error: 'QR ainda não disponível. Aguarde e tente novamente.',
             status: state.status,
         });
     }
     res.json({
-        base64:      state.qrBase64,
-        updated_at:  state.qrUpdatedAt,
-        age_ms:      Date.now() - state.qrUpdatedAt,
-        expires_in:  Math.max(0, 60 - Math.floor((Date.now() - state.qrUpdatedAt) / 1000)),
+        base64:     state.qrBase64,
+        updated_at: state.qrUpdatedAt,
+        age_ms:     Date.now() - state.qrUpdatedAt,
+        expires_in: Math.max(0, 60 - Math.floor((Date.now() - state.qrUpdatedAt) / 1000)),
     });
 });
 
 app.post('/send', auth, async (req, res) => {
     const { phone, message } = req.body;
-    if (!phone || !message) {
-        return res.status(400).json({ error: 'Campos obrigatórios: phone, message' });
-    }
-    if (!state.connected || !state.sock) {
-        return res.status(503).json({ error: 'WhatsApp não conectado. Escaneie o QR Code primeiro.' });
-    }
+    if (!phone || !message) return res.status(400).json({ error: 'Campos obrigatórios: phone, message' });
+    if (!state.connected || !state.sock) return res.status(503).json({ error: 'WhatsApp não conectado.' });
     try {
         const jid = formatPhone(phone);
         await state.sock.sendMessage(jid, { text: message });
@@ -305,30 +304,24 @@ app.post('/logout', auth, async (req, res) => {
 
 app.post('/reconnect', auth, async (req, res) => {
     try {
-        if (state.sock) {
-            state.sock.end();
-            state.sock = null;
-        }
+        if (state.sock) { state.sock.end(); state.sock = null; }
         _starting = false;
-        await delay(1500);
-        await startWhatsApp();
+        await sleep(1500);
+        startWhatsApp().catch(err => { _starting = false; });
         res.json({ success: true, message: 'Reconectando...' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// ── Inicia servidor ───────────────────────────────────────────
-// NOTA: startWhatsApp() NÃO é chamado aqui no boot para evitar OOM no Railway.
-// O Baileys só é iniciado quando /instance/connect é chamado pelo sistema.
 app.listen(PORT, () => {
     console.log(`\n╔══════════════════════════════════════════╗`);
     console.log(`║   Morpheus WhatsApp Server               ║`);
-    console.log(`║   Porta: ${PORT.toString().padEnd(34)}║`);
-    console.log(`║   API Key: ${API_KEY.substring(0,8)}...${' '.repeat(Math.max(0,28-API_KEY.length))}║`);
-    console.log(`║   Aguardando trigger de conexão...       ║`);
+    console.log(`║   Porta: ${String(PORT).padEnd(34)}║`);
+    console.log(`║   Instância: ${INSTANCE_NAME.padEnd(29)}║`);
+    console.log(`║   Aguardando trigger WhatsApp...         ║`);
     console.log(`╚══════════════════════════════════════════╝\n`);
 });
 
 process.on('uncaughtException',  (err) => console.error('[ERRO]', err.message));
-process.on('unhandledRejection', (err) => console.error('[REJECT]', err));
+process.on('unhandledRejection', (err) => console.error('[REJECT]', err?.message || err));
