@@ -2,20 +2,6 @@
  * Morpheus WhatsApp Server
  * Servidor HTTP baseado em Baileys (ESM-compatible via dynamic import)
  * Compatível com Evolution API — usado pelo sistema Morpheus PDV
- *
- * Endpoints:
- *   GET  /health                          → healthcheck (sem auth)
- *   GET  /status                          → estado da conexão
- *   GET  /qr                              → QR Code em base64
- *   POST /send                            → enviar { phone, message }
- *   POST /logout                          → desconectar sessão
- *   POST /reconnect                       → reconectar sem logout
- *   GET  /instance/fetchInstances         → listar instâncias (Evolution API)
- *   GET  /instance/connectionState/:inst  → estado (Evolution API)
- *   GET  /instance/connect/:inst          → conectar / buscar QR (Evolution API)
- *   POST /instance/create                 → criar instância (no-op)
- *   DELETE /instance/logout/:inst         → logout (Evolution API)
- *   POST /message/sendText/:inst          → enviar texto (Evolution API)
  */
 
 require('dotenv').config();
@@ -26,7 +12,6 @@ const pino    = require('pino');
 const path    = require('path');
 const fs      = require('fs');
 
-// ── Configurações ─────────────────────────────────────────────
 const PORT          = process.env.PORT          || 65002;
 const API_KEY       = process.env.API_KEY       || 'morpheus-wpp-2026';
 const INSTANCE_NAME = process.env.INSTANCE_NAME || 'morpheus-pdv';
@@ -35,7 +20,6 @@ const AUTH_DIR      = path.join(__dirname, 'auth_session');
 const app = express();
 app.use(express.json());
 
-// ── Estado global ─────────────────────────────────────────────
 const state = {
     sock:        null,
     connected:   false,
@@ -46,28 +30,23 @@ const state = {
     phoneNumber: null,
 };
 
-// ── Middleware de autenticação ─────────────────────────────────
 function auth(req, res, next) {
     const key = req.headers['apikey'] || req.headers['api-key'] || req.query.apikey;
     if (key !== API_KEY) return res.status(401).json({ error: 'Chave de API inválida.' });
     next();
 }
 
-// ── Utilitário de delay ───────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ── Controle de reconexão ─────────────────────────────────────
 let _reconnectCount = 0;
 let _starting       = false;
 
-// ── Iniciar WhatsApp com dynamic import (suporte ESM) ─────────
 async function startWhatsApp() {
     if (_starting) return;
     _starting = true;
 
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-    // ── Dynamic import do Baileys (ESM) ───────────────────────
     const {
         default: makeWASocket,
         useMultiFileAuthState,
@@ -158,7 +137,6 @@ async function startWhatsApp() {
     return sock;
 }
 
-// ── Formatar número ────────────────────────────────────────────
 function formatPhone(phone) {
     let n = phone.replace(/\D/g, '');
     if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
@@ -207,8 +185,9 @@ app.get('/instance/connect/:instance', auth, async (req, res) => {
             _starting = false;
         });
     }
+    // Aguarda QR (até 45s — Baileys leva ~30s para conectar ao WhatsApp)
     let waited = 0;
-    while (!state.qrBase64 && !state.connected && waited < 20000) {
+    while (!state.qrBase64 && !state.connected && waited < 45000) {
         await sleep(500);
         waited += 500;
     }
@@ -314,13 +293,18 @@ app.post('/reconnect', auth, async (req, res) => {
     }
 });
 
+// ── Inicia servidor HTTP ───────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`\n╔══════════════════════════════════════════╗`);
     console.log(`║   Morpheus WhatsApp Server               ║`);
     console.log(`║   Porta: ${String(PORT).padEnd(34)}║`);
     console.log(`║   Instância: ${INSTANCE_NAME.padEnd(29)}║`);
-    console.log(`║   Aguardando trigger WhatsApp...         ║`);
     console.log(`╚══════════════════════════════════════════╝\n`);
+    // Inicia Baileys imediatamente para que o QR esteja pronto quando solicitado
+    startWhatsApp().catch(err => {
+        console.error('[WPP] Erro no boot:', err.message);
+        _starting = false;
+    });
 });
 
 process.on('uncaughtException',  (err) => console.error('[ERRO]', err.message));
