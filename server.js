@@ -175,7 +175,8 @@ app.get('/instance/connectionState/:instance', auth, (req, res) => {
     res.json({ instance: { instanceName: req.params.instance, state: evState } });
 });
 
-app.get('/instance/connect/:instance', auth, async (req, res) => {
+// /instance/connect — resposta imediata (sem bloqueio)
+app.get('/instance/connect/:instance', auth, (req, res) => {
     if (state.connected) {
         return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
     }
@@ -185,19 +186,11 @@ app.get('/instance/connect/:instance', auth, async (req, res) => {
             _starting = false;
         });
     }
-    // Aguarda QR (até 45s — Baileys leva ~30s para conectar ao WhatsApp)
-    let waited = 0;
-    while (!state.qrBase64 && !state.connected && waited < 45000) {
-        await sleep(500);
-        waited += 500;
+    if (state.qrBase64) {
+        return res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
     }
-    if (state.connected) {
-        return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
-    }
-    if (!state.qrBase64) {
-        return res.status(202).json({ error: 'QR ainda não disponível. Tente novamente.' });
-    }
-    res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
+    // 202 = ainda iniciando, cliente deve tentar novamente em alguns segundos
+    return res.status(202).json({ status: state.status, message: 'Iniciando WhatsApp...' });
 });
 
 app.post('/instance/create', auth, (req, res) => {
@@ -233,16 +226,13 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
     }
 });
 
-app.get('/qr', auth, async (req, res) => {
+app.get('/qr', auth, (req, res) => {
     if (state.connected) return res.json({ error: 'Já conectado.' });
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => { _starting = false; });
     }
     if (!state.qrBase64) {
-        return res.status(202).json({
-            error: 'QR ainda não disponível. Aguarde e tente novamente.',
-            status: state.status,
-        });
+        return res.status(202).json({ error: 'QR ainda não disponível.', status: state.status });
     }
     res.json({
         base64:     state.qrBase64,
@@ -293,14 +283,13 @@ app.post('/reconnect', auth, async (req, res) => {
     }
 });
 
-// ── Inicia servidor HTTP ───────────────────────────────────────
+// ── Inicia servidor ───────────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`\n╔══════════════════════════════════════════╗`);
     console.log(`║   Morpheus WhatsApp Server               ║`);
     console.log(`║   Porta: ${String(PORT).padEnd(34)}║`);
     console.log(`║   Instância: ${INSTANCE_NAME.padEnd(29)}║`);
     console.log(`╚══════════════════════════════════════════╝\n`);
-    // Inicia Baileys imediatamente para que o QR esteja pronto quando solicitado
     startWhatsApp().catch(err => {
         console.error('[WPP] Erro no boot:', err.message);
         _starting = false;
