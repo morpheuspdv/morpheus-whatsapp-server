@@ -32,10 +32,11 @@ const {
 } = require('@whiskeysockets/baileys');
 
 // ── Configurações ─────────────────────────────────────────────
-const PORT      = process.env.PORT      || 65002;  // Railway define PORT automaticamente
-const API_KEY   = process.env.API_KEY   || 'morpheus-wpp-2026';
-const AUTH_DIR  = path.join(__dirname, 'auth_session');
-const LOG_LEVEL = process.env.LOG_LEVEL || 'silent'; // silent em produção
+const PORT          = process.env.PORT          || 65002;
+const API_KEY       = process.env.API_KEY       || 'morpheus-wpp-2026';
+const INSTANCE_NAME = process.env.INSTANCE_NAME || 'morpheus-pdv';
+const AUTH_DIR      = path.join(__dirname, 'auth_session');
+const LOG_LEVEL     = process.env.LOG_LEVEL     || 'silent';
 
 const logger = pino({ level: LOG_LEVEL });
 const app    = express();
@@ -164,6 +165,70 @@ app.get('/status', auth, (req, res) => {
         qr_ready:    !!state.qrBase64,
         qr_age_ms:   state.qrUpdatedAt ? Date.now() - state.qrUpdatedAt : null,
     });
+});
+
+// ── Compatibilidade Evolution API ─────────────────────────────
+
+// Listar instâncias
+app.get('/instance/fetchInstances', auth, (req, res) => {
+    res.json([{ instanceName: INSTANCE_NAME, instance: { instanceName: INSTANCE_NAME, status: state.status } }]);
+});
+
+// Estado da conexão
+app.get('/instance/connectionState/:instance', auth, (req, res) => {
+    const evState = state.connected ? 'open' : (state.status === 'qr_ready' ? 'connecting' : 'close');
+    res.json({ instance: { instanceName: req.params.instance, state: evState } });
+});
+
+// Conectar / buscar QR Code
+app.get('/instance/connect/:instance', auth, async (req, res) => {
+    if (state.connected) {
+        return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
+    }
+    // Aguarda QR ficar disponível (até 8s)
+    let waited = 0;
+    while (!state.qrBase64 && waited < 8000) {
+        await delay(500);
+        waited += 500;
+    }
+    if (!state.qrBase64) {
+        return res.status(202).json({ error: 'QR ainda não disponível. Tente novamente em instantes.' });
+    }
+    res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
+});
+
+// Criar instância (no-op — já existe)
+app.post('/instance/create', auth, (req, res) => {
+    res.json({ instance: { instanceName: INSTANCE_NAME, status: 'created' } });
+});
+
+// Logout / desconectar instância
+app.delete('/instance/logout/:instance', auth, async (req, res) => {
+    try {
+        if (state.sock) await state.sock.logout();
+        state.connected = false;
+        state.status    = 'logged_out';
+        state.qrBase64  = null;
+        fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Enviar mensagem (formato Evolution API)
+app.post('/message/sendText/:instance', auth, async (req, res) => {
+    const { number, text } = req.body;
+    if (!number || !text) return res.status(400).json({ error: 'Campos obrigatórios: number, text' });
+    if (!state.connected || !state.sock) return res.status(503).json({ error: 'WhatsApp não conectado.' });
+    try {
+        let n = number.replace(/\D/g, '');
+        if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
+        await state.sock.sendMessage(n + '@s.whatsapp.net', { text });
+        res.json({ key: { id: Date.now().toString() }, status: 'PENDING' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 
 // QR Code em base64
