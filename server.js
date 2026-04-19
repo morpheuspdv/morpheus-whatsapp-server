@@ -94,7 +94,7 @@ async function startWhatsApp() {
         version,
         auth:                authState,
         logger:              pino({ level: 'silent' }),
-        printQRInTerminal:   true,
+        printQRInTerminal:   false,
         browser:             ['Morpheus PDV', 'Chrome', '120.0'],
         connectTimeoutMs:    30_000,
         keepAliveIntervalMs: 25_000,
@@ -167,12 +167,43 @@ async function startWhatsApp() {
     return sock;
 }
 
-// ── Formatar número ────────────────────────────────────────────
+// ── Resolver JID correto via onWhatsApp ───────────────────────
+// Consulta os servidores do WhatsApp para obter o JID real do número.
+// Tenta com e sem o 9º dígito (regra brasileira).
+async function resolveJid(sock, rawNumber) {
+    let n = rawNumber.replace(/\D/g, '');
+    if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
+    if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
+
+    // Candidatos: com 9 e sem 9
+    const candidates = [n];
+    if (n.startsWith('55') && n.length === 13) {
+        // sem o 9º dígito
+        candidates.push(n.slice(0, 4) + n.slice(5));
+    } else if (n.startsWith('55') && n.length === 12) {
+        // com o 9º dígito
+        candidates.push(n.slice(0, 4) + '9' + n.slice(4));
+    }
+
+    for (const candidate of candidates) {
+        try {
+            const [res] = await sock.onWhatsApp(candidate);
+            if (res?.exists) {
+                console.log(`[WPP] onWhatsApp: ${candidate} → JID real: ${res.jid}`);
+                return res.jid;
+            }
+        } catch (_) {}
+    }
+
+    // Fallback: usa o primeiro candidato mesmo sem confirmação
+    console.log(`[WPP] onWhatsApp: nenhum candidato confirmado, usando fallback ${candidates[0]}`);
+    return candidates[0] + '@s.whatsapp.net';
+}
+
+// ── Formatar número (fallback sem onWhatsApp) ──────────────────
 function formatPhone(phone) {
     let n = phone.replace(/\D/g, '');
     if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
-    // 9º dígito: celulares BR = 55 + DDD(2) + 9 + 8 dígitos = 13 no total
-    // Se chegou com 12 (sem o 9), insere o 9 após o DDD
     if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
     return n + '@s.whatsapp.net';
 }
@@ -218,18 +249,15 @@ app.get('/instance/connect/:instance', auth, async (req, res) => {
     if (state.connected) {
         return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
     }
-    // Dispara Baileys se ainda não estiver rodando
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => {
             console.error('[WPP] Erro ao iniciar:', err.message);
             _starting = false;
         });
     }
-    // Resposta imediata — sem bloqueio (PHP tem timeout curto)
     if (state.qrBase64) {
         return res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
     }
-    // 202 = ainda iniciando, JS vai tentar novamente
     return res.status(202).json({ status: state.status, message: 'Iniciando WhatsApp...' });
 });
 
@@ -257,11 +285,8 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
     if (!number || !text) return res.status(400).json({ error: 'Campos obrigatórios: number, text' });
     if (!state.connected || !state.sock) return res.status(503).json({ error: 'WhatsApp não conectado.' });
     try {
-        let n = number.replace(/\D/g, '');
-        if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
-        if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
-        const jid = n + '@s.whatsapp.net';
-        console.log(`[WPP] sendText → número recebido: "${number}" | JID: ${jid} | texto: ${text.slice(0, 50)}`);
+        const jid = await resolveJid(state.sock, number);
+        console.log(`[WPP] sendText → número: "${number}" | JID resolvido: ${jid} | texto: ${text.slice(0, 50)}`);
         const result = await state.sock.sendMessage(jid, { text });
         console.log(`[WPP] sendText OK → msgId: ${result?.key?.id} | remoteJid: ${result?.key?.remoteJid}`);
         res.json({ key: { id: result?.key?.id || Date.now().toString() }, status: 'PENDING' });
@@ -274,7 +299,6 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
 // QR Code em base64
 app.get('/qr', auth, async (req, res) => {
     if (state.connected) return res.json({ error: 'Já conectado.' });
-    // Dispara Baileys se necessário
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => { _starting = false; });
     }
@@ -298,8 +322,8 @@ app.post('/send', auth, async (req, res) => {
     if (!phone || !message) return res.status(400).json({ error: 'Campos obrigatórios: phone, message' });
     if (!state.connected || !state.sock) return res.status(503).json({ error: 'WhatsApp não conectado.' });
     try {
-        const jid = formatPhone(phone);
-        console.log(`[WPP] /send → phone: "${phone}" | JID: ${jid}`);
+        const jid = await resolveJid(state.sock, phone);
+        console.log(`[WPP] /send → phone: "${phone}" | JID resolvido: ${jid}`);
         await state.sock.sendMessage(jid, { text: message });
         res.json({ success: true, phone: jid.replace('@s.whatsapp.net', '') });
     } catch (err) {
@@ -344,7 +368,6 @@ app.listen(PORT, () => {
     console.log(`║   Porta: ${String(PORT).padEnd(34)}║`);
     console.log(`║   Instância: ${INSTANCE_NAME.padEnd(29)}║`);
     console.log(`╚══════════════════════════════════════════╝\n`);
-    // Inicia Baileys imediatamente para que o QR esteja pronto quando solicitado
     startWhatsApp().catch(err => {
         console.error('[WPP] Erro no boot:', err.message);
         _starting = false;
