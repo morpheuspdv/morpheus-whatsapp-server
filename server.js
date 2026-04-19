@@ -260,9 +260,13 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
         let n = number.replace(/\D/g, '');
         if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
         if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
-        await state.sock.sendMessage(n + '@s.whatsapp.net', { text });
-        res.json({ key: { id: Date.now().toString() }, status: 'PENDING' });
+        const jid = n + '@s.whatsapp.net';
+        console.log(`[WPP] sendText → número recebido: "${number}" | JID: ${jid} | texto: ${text.slice(0, 50)}`);
+        const result = await state.sock.sendMessage(jid, { text });
+        console.log(`[WPP] sendText OK → msgId: ${result?.key?.id} | remoteJid: ${result?.key?.remoteJid}`);
+        res.json({ key: { id: result?.key?.id || Date.now().toString() }, status: 'PENDING' });
     } catch (err) {
+        console.error(`[WPP] sendText ERRO → ${err.message}`);
         res.status(500).json({ error: err.message });
     }
 });
@@ -295,6 +299,7 @@ app.post('/send', auth, async (req, res) => {
     if (!state.connected || !state.sock) return res.status(503).json({ error: 'WhatsApp não conectado.' });
     try {
         const jid = formatPhone(phone);
+        console.log(`[WPP] /send → phone: "${phone}" | JID: ${jid}`);
         await state.sock.sendMessage(jid, { text: message });
         res.json({ success: true, phone: jid.replace('@s.whatsapp.net', '') });
     } catch (err) {
