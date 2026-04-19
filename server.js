@@ -2,6 +2,20 @@
  * Morpheus WhatsApp Server
  * Servidor HTTP baseado em Baileys (ESM-compatible via dynamic import)
  * Compatível com Evolution API — usado pelo sistema Morpheus PDV
+ *
+ * Endpoints:
+ *   GET  /health                          → healthcheck (sem auth)
+ *   GET  /status                          → estado da conexão
+ *   GET  /qr                              → QR Code em base64
+ *   POST /send                            → enviar { phone, message }
+ *   POST /logout                          → desconectar sessão
+ *   POST /reconnect                       → reconectar sem logout
+ *   GET  /instance/fetchInstances         → listar instâncias (Evolution API)
+ *   GET  /instance/connectionState/:inst  → estado (Evolution API)
+ *   GET  /instance/connect/:inst          → conectar / buscar QR (Evolution API)
+ *   POST /instance/create                 → criar instância (no-op)
+ *   DELETE /instance/logout/:inst         → logout (Evolution API)
+ *   POST /message/sendText/:inst          → enviar texto (Evolution API)
  */
 
 require('dotenv').config();
@@ -12,6 +26,7 @@ const pino    = require('pino');
 const path    = require('path');
 const fs      = require('fs');
 
+// ── Configurações ─────────────────────────────────────────────
 const PORT          = process.env.PORT          || 65002;
 const API_KEY       = process.env.API_KEY       || 'morpheus-wpp-2026';
 const INSTANCE_NAME = process.env.INSTANCE_NAME || 'morpheus-pdv';
@@ -20,33 +35,40 @@ const AUTH_DIR      = path.join(__dirname, 'auth_session');
 const app = express();
 app.use(express.json());
 
+// ── Estado global ─────────────────────────────────────────────
 const state = {
     sock:        null,
     connected:   false,
     qrBase64:    null,
     qrRaw:       null,
     qrUpdatedAt: 0,
-    status:      'disconnected',
+    status:      'disconnected',   // disconnected | qr_ready | connected | logged_out
     phoneNumber: null,
 };
 
+// ── Middleware de autenticação ─────────────────────────────────
 function auth(req, res, next) {
     const key = req.headers['apikey'] || req.headers['api-key'] || req.query.apikey;
     if (key !== API_KEY) return res.status(401).json({ error: 'Chave de API inválida.' });
     next();
 }
 
+// ── Utilitário de delay (não depende do Baileys) ───────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// ── Controle de reconexão ─────────────────────────────────────
 let _reconnectCount = 0;
 let _starting       = false;
 
+// ── Iniciar WhatsApp com dynamic import (suporte ESM) ─────────
 async function startWhatsApp() {
     if (_starting) return;
     _starting = true;
 
+    // Garante diretório de sessão
     if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
+    // ── Dynamic import do Baileys (ESM) ───────────────────────
     const {
         default: makeWASocket,
         useMultiFileAuthState,
@@ -57,6 +79,7 @@ async function startWhatsApp() {
 
     const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
+    // Versão do protocolo WhatsApp — fallback se offline
     let version = [2, 3000, 1015901307];
     try {
         const result = await fetchLatestBaileysVersion();
@@ -83,6 +106,7 @@ async function startWhatsApp() {
 
     state.sock = sock;
 
+    // ── Eventos de conexão ────────────────────────────────────
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
@@ -112,11 +136,18 @@ async function startWhatsApp() {
         if (connection === 'close') {
             state.connected = false;
             state.status    = 'disconnected';
+            state.qrBase64  = null;
+            state.qrRaw     = null;
             _starting       = false;
             const code      = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = code !== DisconnectReason.loggedOut;
 
             console.log(`[WPP] Desconectado (código ${code}). Reconectar: ${shouldReconnect}`);
+
+            // Limpa socket antigo antes de reconectar (evita memory leak)
+            const oldSock = state.sock;
+            state.sock = null;
+            try { oldSock?.ev?.removeAllListeners?.(); } catch (_) {}
 
             if (shouldReconnect) {
                 _reconnectCount++;
@@ -127,7 +158,6 @@ async function startWhatsApp() {
             } else {
                 console.log('[WPP] Logout detectado — limpando sessão...');
                 state.status = 'logged_out';
-                state.sock   = null;
                 fs.rmSync(AUTH_DIR, { recursive: true, force: true });
             }
         }
@@ -137,6 +167,7 @@ async function startWhatsApp() {
     return sock;
 }
 
+// ── Formatar número ────────────────────────────────────────────
 function formatPhone(phone) {
     let n = phone.replace(/\D/g, '');
     if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
@@ -147,10 +178,12 @@ function formatPhone(phone) {
 //  ROTAS
 // ══════════════════════════════════════════════════════════════
 
+// Health check (sem autenticação)
 app.get('/health', (req, res) => {
     res.json({ ok: true, status: state.status, uptime: process.uptime() });
 });
 
+// Status da conexão
 app.get('/status', auth, (req, res) => {
     res.json({
         status:    state.status,
@@ -160,6 +193,8 @@ app.get('/status', auth, (req, res) => {
         qr_age_ms: state.qrUpdatedAt ? Date.now() - state.qrUpdatedAt : null,
     });
 });
+
+// ── Evolution API compatibility ────────────────────────────────
 
 app.get('/instance/fetchInstances', auth, (req, res) => {
     res.json([{
@@ -175,21 +210,23 @@ app.get('/instance/connectionState/:instance', auth, (req, res) => {
     res.json({ instance: { instanceName: req.params.instance, state: evState } });
 });
 
-// /instance/connect — resposta imediata (sem bloqueio)
-app.get('/instance/connect/:instance', auth, (req, res) => {
+// Conectar / buscar QR Code — inicia Baileys sob demanda
+app.get('/instance/connect/:instance', auth, async (req, res) => {
     if (state.connected) {
         return res.json({ instance: { instanceName: req.params.instance, state: 'open' } });
     }
+    // Dispara Baileys se ainda não estiver rodando
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => {
             console.error('[WPP] Erro ao iniciar:', err.message);
             _starting = false;
         });
     }
+    // Resposta imediata — sem bloqueio (PHP tem timeout curto)
     if (state.qrBase64) {
         return res.json({ base64: state.qrBase64, qrcode: { base64: state.qrBase64 } });
     }
-    // 202 = ainda iniciando, cliente deve tentar novamente em alguns segundos
+    // 202 = ainda iniciando, JS vai tentar novamente
     return res.status(202).json({ status: state.status, message: 'Iniciando WhatsApp...' });
 });
 
@@ -226,13 +263,18 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
     }
 });
 
-app.get('/qr', auth, (req, res) => {
+// QR Code em base64
+app.get('/qr', auth, async (req, res) => {
     if (state.connected) return res.json({ error: 'Já conectado.' });
+    // Dispara Baileys se necessário
     if (!state.sock && !_starting) {
         startWhatsApp().catch(err => { _starting = false; });
     }
     if (!state.qrBase64) {
-        return res.status(202).json({ error: 'QR ainda não disponível.', status: state.status });
+        return res.status(202).json({
+            error: 'QR ainda não disponível. Aguarde e tente novamente.',
+            status: state.status,
+        });
     }
     res.json({
         base64:     state.qrBase64,
@@ -242,6 +284,7 @@ app.get('/qr', auth, (req, res) => {
     });
 });
 
+// Enviar mensagem
 app.post('/send', auth, async (req, res) => {
     const { phone, message } = req.body;
     if (!phone || !message) return res.status(400).json({ error: 'Campos obrigatórios: phone, message' });
@@ -256,6 +299,7 @@ app.post('/send', auth, async (req, res) => {
     }
 });
 
+// Logout
 app.post('/logout', auth, async (req, res) => {
     try {
         if (state.sock) await state.sock.logout();
@@ -271,6 +315,7 @@ app.post('/logout', auth, async (req, res) => {
     }
 });
 
+// Reconectar sem logout
 app.post('/reconnect', auth, async (req, res) => {
     try {
         if (state.sock) { state.sock.end(); state.sock = null; }
@@ -283,18 +328,20 @@ app.post('/reconnect', auth, async (req, res) => {
     }
 });
 
-// ── Inicia servidor ───────────────────────────────────────────
+// ── Inicia servidor HTTP ───────────────────────────────────────
 app.listen(PORT, () => {
     console.log(`\n╔══════════════════════════════════════════╗`);
     console.log(`║   Morpheus WhatsApp Server               ║`);
     console.log(`║   Porta: ${String(PORT).padEnd(34)}║`);
     console.log(`║   Instância: ${INSTANCE_NAME.padEnd(29)}║`);
     console.log(`╚══════════════════════════════════════════╝\n`);
+    // Inicia Baileys imediatamente para que o QR esteja pronto quando solicitado
     startWhatsApp().catch(err => {
         console.error('[WPP] Erro no boot:', err.message);
         _starting = false;
     });
 });
 
+// Captura erros não tratados para evitar crash
 process.on('uncaughtException',  (err) => console.error('[ERRO]', err.message));
 process.on('unhandledRejection', (err) => console.error('[REJECT]', err?.message || err));
