@@ -171,6 +171,9 @@ async function startWhatsApp() {
 function formatPhone(phone) {
     let n = phone.replace(/\D/g, '');
     if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
+    // 9º dígito: celulares BR = 55 + DDD(2) + 9 + 8 dígitos = 13 no total
+    // Se chegou com 12 (sem o 9), insere o 9 após o DDD
+    if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
     return n + '@s.whatsapp.net';
 }
 
@@ -256,6 +259,7 @@ app.post('/message/sendText/:instance', auth, async (req, res) => {
     try {
         let n = number.replace(/\D/g, '');
         if (!n.startsWith('55') && n.length <= 11) n = '55' + n;
+        if (n.startsWith('55') && n.length === 12) n = n.slice(0, 4) + '9' + n.slice(4);
         await state.sock.sendMessage(n + '@s.whatsapp.net', { text });
         res.json({ key: { id: Date.now().toString() }, status: 'PENDING' });
     } catch (err) {
